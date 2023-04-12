@@ -46,6 +46,16 @@ def is_linux() -> bool:
 	return sys.platform.startswith("linux")
 
 
+def is_darwin() -> bool:
+	"""Determine if the local machine is running macOS
+
+	Returns:
+		bool: True if the local machine runs macOS
+	"""
+
+	return sys.platform.startswith("darwin")
+
+
 def is_root() -> bool:
 	"""Determine if this instance of the program is being ran as root
 

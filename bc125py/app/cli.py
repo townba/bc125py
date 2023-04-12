@@ -2,6 +2,7 @@ import os
 import sys
 import argparse
 import datetime
+import sys
 import bc125py
 from bc125py.app import core, log
 from bc125py import sdo, con as _c
@@ -18,7 +19,7 @@ _port_detect_legacy = False
 
 # Make sure we are root function
 def enforce_root() -> None:
-	if not core.is_root():
+	if not core.is_root() and not core.is_darwin():
 		print(bc125py.PACKAGE_NAME, "must be ran as superuser (root) to perform this function.")
 		sys.exit(126)
 	
@@ -162,7 +163,7 @@ def main() -> int:
 		log._FILE = open(cli_args.log, "w")
 	log.debug(bc125py.PACKAGE_NAME, "version", bc125py.PACKAGE_VERSION + ", started on", datetime.datetime.now())
 	log.debug("sysinfo:", core.get_system_str())
-	if not core.is_linux():
+	if not core.is_linux() and not core.is_darwin():
 		log.warn("Your system is unsupported!")
 
 	# Set port, if specified

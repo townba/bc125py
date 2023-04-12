@@ -1,11 +1,24 @@
 import os
 import glob
+import sys
 import time
 from bc125py.app import log
 try:
 	import serial
 except ImportError:
-	log.error("pySerial not found (import serial failed)")
+	class serial: Serial = None
+	# We also try PyUSB
+	pass
+try:
+	import usb
+	from usb.backend import libusb1
+except ImportError:
+	class usb:
+		class core:
+			Device = None
+			Endpoint = None
+	if not "serial" in sys.modules:
+		log.error("Neither pySerial nor PyUSB were loaded (imports failed)")
 
 
 class CommandError(RuntimeError):
@@ -25,6 +38,9 @@ class ScannerConnection:
 
 	connected: bool = False
 	__serial: serial.Serial = None
+	__dev: usb.core.Device = None
+	__ep_in: usb.core.Endpoint = None
+	__ep_out: usb.core.Endpoint = None
 
 
 	def __init__(self):
@@ -44,19 +60,24 @@ class ScannerConnection:
 		if self.connected:
 			raise ConnectionError("Connection already established")
 
-		# First, set up device driver. It doesn't matter if we do this multiple times
-		ScannerConnection.__setup_driver()
+		if "serial" in sys.modules:
+			try:
+				# First, set up device driver. It doesn't matter if we do this multiple times
+				ScannerConnection.__setup_driver()
 
-		# Second, determine device path
-		if not port:
-			found_ports = ScannerConnection.find_ports()
+				# Second, determine device path
+				if not port:
+					found_ports = ScannerConnection.find_ports()
 
-			if len(found_ports) < 1:
-				raise ConnectionError("Could not find any scanner")
+					if len(found_ports) < 1:
+						raise ConnectionError("Could not find any scanner")
 
-			port = found_ports[0]
+					port = found_ports[0]
 
-		log.debug("con: using port: " + port)
+				log.debug("con: using port: " + port)
+			except ConnectionError as e:
+				# We'll try PyUSB next.
+				pass
 
 		# Third, establish a device connection.
 		self.__open_connection(port)
@@ -75,14 +96,48 @@ class ScannerConnection:
 			ConnectionError: if connection fails
 		"""
 
-		# Now, try to open the device file
-		try:
-			self.__serial = serial.Serial(port)
-			self.__serial.timeout = 120
-			self.__serial.reset_input_buffer()
-			self.__serial.reset_output_buffer()
+		if "serial" in sys.modules and port != usb:
+			# Now, try to open the device file
+			try:
+				self.__serial = serial.Serial(port)
+				self.__serial.timeout = 120
+				self.__serial.reset_input_buffer()
+				self.__serial.reset_output_buffer()
+				return
 
-		except serial.SerialException as e:
+			except serial.SerialException as e:
+				raise ConnectionError("Error connecting to scanner: " + str(e))
+
+		if not "usb" in sys.modules:
+			raise ConnectionError("Error connecting to scanner: No communication method available.")
+
+		# Try to open the device file
+		try:
+			self.__dev = usb.core.find(
+				idVendor=0x1965, idProduct=0x0017,
+				custom_match=lambda dev:
+					usb.util.get_string(dev, dev.iProduct) in ("BC125AT", "UBC125XLT", "UBC126AT"))
+			if self.__dev is None:
+			  raise FileNotFoundError("BC125AT or variant not found.")
+
+			self.__dev.set_configuration()
+			cfg = self.__dev.get_active_configuration()
+			intf = next((intf for intf in cfg if intf.bInterfaceClass == 0xA), None)
+			if intf is None:
+				raise FileNotFoundError("Interface not found.")
+
+			self.__ep_in = usb.util.find_descriptor(
+				intf,
+				custom_match = lambda e:
+					usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN)
+			self.__ep_out = usb.util.find_descriptor(
+				intf,
+				custom_match = lambda e:
+					usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT)
+			if self.__ep_in is None or self.__ep_out is None:
+				raise FileNotFoundError("Endpoint(s) not found.")
+
+		except Exception as e:
 			raise ConnectionError("Error connecting to scanner: " + str(e))
 
 
@@ -106,18 +161,29 @@ class ScannerConnection:
 			send_data: bytes = bytes(command + "\r", "ascii")
 			# Send command
 			log.debug("con_exec: send:", send_data)
-			self.__serial.write(send_data)
-		except serial.SerialException as e:
+			if self.__serial:
+				self.__serial.write(send_data)
+			elif self.__ep_out:
+				self.__ep_out.write(send_data, timeout=120000)
+		except Exception as e:
 			raise ConnectionError("Could not communicate (write) with scanner: " + str(e))
 
 		# Response variable
-		resp: bytes = b"ERROR"
+		resp: bytes = b""
 
 		# Read data from scanner
 		try:
-			resp = self.__serial.read_until(b"\r")
+			if self.__serial:
+				resp = self.__serial.read_until(b"\r")
+			elif self.__ep_in:
+				while True:
+					resp += self.__ep_in.read(16384, timeout=120000).tobytes()
+					if resp[-1] == b"\r"[0]:
+						break
+				resp = resp[:-1]
+
 			log.debug("con_exec: resp:", resp)
-		except serial.SerialException as e:
+		except Exception as e:
 			raise ConnectionError("Could not communicate (read) with scanner: " + str(e))
 
 		# Decode and return response
@@ -180,7 +246,8 @@ class ScannerConnection:
 
 		if not self.connected:
 			raise ConnectionError("Can't close closed connection")
-		self.__serial.close()
+		if self.__serial:
+			self.__serial.close()
 		self.connected = False
 		log.debug("con: connection closed")
 
@@ -206,7 +273,11 @@ class ScannerConnection:
 		"""
 
 		# First, set up device driver. It doesn't matter if we do this multiple times
-		ScannerConnection.__setup_driver()
+		try:
+			ScannerConnection.__setup_driver()
+		except ConnectionError as e:
+			# We'll try PyUSB.
+			return [usb]
 
 		# Create array for all possible found results
 		found_ports = []
